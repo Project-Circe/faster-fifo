@@ -3,7 +3,7 @@
 import multiprocessing
 import subprocess
 import sys
-from queue import Full
+from queue import Empty, Full
 from unittest import TestCase
 
 from faster_fifo import Queue, QueueError
@@ -114,6 +114,47 @@ class TestForkBytesPut(TestCase):
             text=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class TestFastGet(TestCase):
+    def _queue(self):
+        return Queue(dumps=_identity_dumps, loads=_identity_loads)
+
+    def test_get_many_preserves_order(self):
+        queue = self._queue()
+        queue.put_many([b"a", b"bb", b"ccc"])
+        self.assertEqual(queue.get_many(max_messages_to_get=3), [b"a", b"bb", b"ccc"])
+        self.assertTrue(queue.empty())
+
+    def test_get_nowait_empty_raises(self):
+        queue = self._queue()
+        with self.assertRaises(Empty):
+            queue.get_nowait()
+
+    def test_get_grows_receive_buffer(self):
+        queue = self._queue()
+        payload = b"z" * 8000
+        queue.put(payload)
+        self.assertEqual(queue.get(), payload)
+
+    def test_loads_sees_each_message_once(self):
+        seen = []
+
+        def loads(raw):
+            seen.append(bytes(raw))
+            return bytes(raw)
+
+        queue = Queue(dumps=_identity_dumps, loads=loads)
+        queue.put(b"one")
+        queue.put_many([b"two", b"three"])
+        self.assertEqual(queue.get(), b"one")
+        self.assertEqual(queue.get_many(max_messages_to_get=2), [b"two", b"three"])
+        self.assertEqual(seen, [b"one", b"two", b"three"])
+
+    def test_pickled_object_roundtrip(self):
+        queue = Queue()
+        queue.put({"k": [1, 2, 3]})
+        self.assertEqual(queue.get(), {"k": [1, 2, 3]})
 
 
 class TestQueueErrorImport(TestCase):

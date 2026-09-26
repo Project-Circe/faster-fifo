@@ -119,6 +119,10 @@ python -m unittest
 
 ## Recent PyPI releases
 
+##### v1.6.1
+
+* `get` and `get_many` use the cached shared-memory address and parse length prefixes in Cython. `loads` is still called once per message.
+
 ##### v1.6.0
 
 * Fork only. `put`/`put_many` of `bytes` copy the buffer directly. `spawn` and `forkserver` raise `QueueError`.

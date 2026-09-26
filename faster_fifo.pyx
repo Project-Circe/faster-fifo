@@ -6,8 +6,11 @@ import ctypes
 import multiprocessing
 import sys
 
+from cpython.buffer cimport PyBUF_READ
 from cpython.bytes cimport PyBytes_AsString, PyBytes_GET_SIZE
 from cpython.mem cimport PyMem_Malloc, PyMem_Free
+from cpython.memoryview cimport PyMemoryView_FromMemory
+from libc.string cimport memcpy
 
 from ctypes import c_size_t
 from multiprocessing import context
@@ -33,6 +36,7 @@ class TLSBuffer(threading.local):
     """Used for recv message buffers, prevents race condition in multithreading (not a problem with multiprocessing)."""
     def __init__(self, v=None):
         self.val = v
+        self.ptr = 0 if v is None else caddr(v)
 
     def __getstate__(self):
         message_buffer_size = 0 if self.val is None else len(self.val)
@@ -41,8 +45,10 @@ class TLSBuffer(threading.local):
     def __setstate__(self, message_buffer_size):
         if message_buffer_size == 0:
             self.val = None
+            self.ptr = 0
         else:
             self.val = (ctypes.c_ubyte * message_buffer_size)()
+            self.ptr = caddr(self.val)
 
 
 cdef size_t caddr(buf):
@@ -146,6 +152,80 @@ cdef int _put_many_bytes(q, list xs, int block, float timeout) except -1:
         PyMem_Free(ptrs)
         PyMem_Free(sizes)
     return _raise_put_status(c_status)
+
+
+cdef list _parse_messages(q, unsigned char* base, size_t num_messages, size_t total_bytes):
+    """Walk length-prefixed messages and call loads on each one.
+
+    The view passed to loads aliases the receive buffer and is only valid for
+    that call. loads must copy anything it wants to keep.
+    """
+    cdef size_t offset = 0
+    cdef size_t msg_size = 0
+    cdef size_t i
+    messages = [None] * num_messages
+    cdef object view
+    for i in range(num_messages):
+        memcpy(&msg_size, base + offset, sizeof(size_t))
+        offset += sizeof(size_t)
+        view = PyMemoryView_FromMemory(
+            <char*>(base + offset), <Py_ssize_t>msg_size, PyBUF_READ,
+        )
+        messages[i] = q.loads(view)
+        offset += msg_size
+    if offset != total_bytes:
+        q._error(
+            "Expected to read {} bytes, but got {} bytes".format(total_bytes, offset)
+        )
+    return messages
+
+
+cdef list _get_many(q, int block, float timeout, size_t max_messages_to_get) except *:
+    cdef size_t messages_read = 0
+    cdef size_t bytes_read = 0
+    cdef size_t messages_size = 0
+    cdef size_t buf_len
+    cdef size_t max_bytes
+    cdef void* msg_ptr
+    cdef void* c_q
+    cdef void* c_mem
+    cdef int status
+    cdef object grown
+    if q.message_buffer.val is None:
+        q.reallocate_msg_buffer(INITIAL_RECV_BUFFER_SIZE)
+    msg_ptr = <void*><size_t>q.message_buffer.ptr
+    buf_len = <size_t>len(q.message_buffer.val)
+    max_bytes = <size_t>q.max_bytes_to_read
+    c_q = _cached_q(q)
+    c_mem = _cached_mem(q)
+    with nogil:
+        status = Q.queue_get(
+            c_q, c_mem, msg_ptr, buf_len,
+            max_messages_to_get, max_bytes,
+            &messages_read, &bytes_read, &messages_size,
+            block, timeout,
+        )
+    if status == Q.Q_MSG_BUFFER_TOO_SMALL and messages_read == 0:
+        grown = messages_size
+        q.reallocate_msg_buffer((grown * 3) // 2)
+        return _get_many(q, 0, timeout, max_messages_to_get)
+    if status == Q.Q_SUCCESS or status == Q.Q_MSG_BUFFER_TOO_SMALL:
+        if messages_read == 0 or bytes_read == 0:
+            q._error(
+                "Expected to read at least 1 message, but got {} messages and {} bytes".format(
+                    messages_read, bytes_read
+                )
+            )
+        messages = _parse_messages(
+            q, <unsigned char*>msg_ptr, messages_read, bytes_read
+        )
+        if status == Q.Q_MSG_BUFFER_TOO_SMALL:
+            grown = messages_size
+            q.reallocate_msg_buffer((grown * 3) // 2)
+        return messages
+    if status == Q.Q_EMPTY:
+        raise Empty()
+    raise Exception("Unexpected queue error {}".format(status))
 
 
 class Queue:
@@ -283,65 +363,7 @@ class Queue:
 
 
     def get_many(self, block=True, timeout=DEFAULT_TIMEOUT, max_messages_to_get=int(1e9)):
-        if self.message_buffer.val is None:
-            self.reallocate_msg_buffer(INITIAL_RECV_BUFFER_SIZE)  # initialize a small buffer at first, it will be increased later if needed
-
-        messages_read = ctypes.c_size_t(0)
-        cdef size_t messages_read_ptr = ctypes.addressof(messages_read)
-
-        bytes_read = ctypes.c_size_t(0)
-        cdef size_t bytes_read_ptr = ctypes.addressof(bytes_read)
-
-        messages_size = ctypes.c_size_t(0)  # this is how much memory we need to allocate to read more messages
-        cdef size_t messages_size_ptr = ctypes.addressof(messages_size)
-
-        # explicitly convert all function parameters to corresponding C-types
-        cdef void* c_q_addr = <void*>q_addr(self)
-        cdef void* c_buf_addr = <void*>buf_addr(self)
-        cdef void* c_msg_buf_addr = <void*>msg_buf_addr(self)
-
-        cdef int c_block = block
-        cdef float c_timeout = timeout
-        cdef size_t c_max_messages_to_get = max_messages_to_get
-        cdef size_t c_max_bytes_to_read = self.max_bytes_to_read
-        cdef size_t c_len_message_buffer = len(self.message_buffer.val)
-
-        cdef int c_status = 0
-
-        with nogil:
-            c_status = Q.queue_get(
-                c_q_addr, c_buf_addr, c_msg_buf_addr, c_len_message_buffer,
-                c_max_messages_to_get, c_max_bytes_to_read,
-                <size_t *>messages_read_ptr,
-                <size_t *>bytes_read_ptr,
-                <size_t *>messages_size_ptr,
-                c_block, c_timeout,
-            )
-
-        status = c_status
-
-        if status == Q.Q_MSG_BUFFER_TOO_SMALL and messages_read.value <= 0:
-            # could not read any messages because msg buffer was too small
-            # reallocate the buffer and try again
-            self.reallocate_msg_buffer(int(messages_size.value * 1.5))
-            return self.get_many_nowait(max_messages_to_get)
-        elif status == Q.Q_SUCCESS or status == Q.Q_MSG_BUFFER_TOO_SMALL:
-            # we definitely managed to read something!
-            if messages_read.value <= 0 or bytes_read.value <= 0:
-                self._error(f'Expected to read at least 1 message, but got {messages_read.value} messages and {bytes_read.value} bytes')
-            messages = self.parse_messages(messages_read.value, bytes_read.value, self.message_buffer)
-
-            if status == Q.Q_MSG_BUFFER_TOO_SMALL:
-                # we could not read as many messages as we wanted
-                # allocate a bigger buffer so next time we can read more
-                self.reallocate_msg_buffer(int(messages_size.value * 1.5))
-
-            return messages
-
-        elif status == Q.Q_EMPTY:
-            raise Empty()
-        else:
-            raise Exception(f'Unexpected queue error {status}')
+        return _get_many(self, block, timeout, max_messages_to_get)
 
     def get_many_nowait(self, max_messages_to_get=int(1e9)):
         return self.get_many(block=False, max_messages_to_get=max_messages_to_get)
@@ -353,32 +375,20 @@ class Queue:
         return self.get(block=False)
 
     def parse_messages(self, num_messages, total_bytes, msg_buffer):
-        messages = [None] * num_messages
-
-        offset = 0
-        for msg_idx in range(num_messages):
-            msg_size = c_size_t.from_buffer(msg_buffer.val, offset)
-            offset += ctypes.sizeof(c_size_t)
-
-            msg_bytes = memoryview(msg_buffer.val)[offset:offset + msg_size.value]
-            #msg_bytes = msg_buffer.val[offset,msg_size.value] #memoryview(msg_buffer.val)[offset:offset + msg_size.value]
-            offset += msg_size.value
-            msg = self.loads(msg_bytes)
-            messages[msg_idx] = msg
-
-        if offset != total_bytes:
-            self._error(f'Expected to read {total_bytes} bytes, but got {offset} bytes')
-        return messages
+        return _parse_messages(
+            self, <unsigned char*>caddr(msg_buffer.val), num_messages, total_bytes
+        )
 
     def reallocate_msg_buffer(self, new_size):
         new_size = max(INITIAL_RECV_BUFFER_SIZE, new_size)
         self.message_buffer.val = (ctypes.c_ubyte * new_size)()
+        self.message_buffer.ptr = caddr(self.message_buffer.val)
 
     def qsize(self):
-        return Q.get_queue_size(<void *>q_addr(self))
+        return Q.get_queue_size(_cached_q(self))
 
     def data_size(self):
-        return Q.get_data_size(<void *>q_addr(self))
+        return Q.get_data_size(_cached_q(self))
 
     def empty(self):
         """
@@ -394,7 +404,7 @@ class Queue:
         If full() returns True it doesn’t guarantee that a subsequent call to get() will not block. 
         Similarly, if full() returns False it doesn’t guarantee that a subsequent call to put() will not block.
         """
-        return Q.is_queue_full(<void *>q_addr(self))
+        return Q.is_queue_full(_cached_q(self))
 
     def join_thread(self):
         """This is not implemented as this implementation does not use a background thread"""
