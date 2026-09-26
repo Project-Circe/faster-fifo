@@ -32,6 +32,5 @@ include = ["faster_fifo*"]
 language_level = 3
 
 [tool.cibuildwheel]
-# Skip CPython 3.6, CPython 3.7, and CPython 3.8
-# Also skip PyPy on all Python versions because of setuptools bug
-skip = ["cp36-*", "cp37-*", "cp38-*", "pp*"]
+build = ["cp313-manylinux_x86_64"]
+archs = ["x86_64"]

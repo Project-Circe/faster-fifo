@@ -20,9 +20,7 @@ Adds `get_many()` and `put_many()` methods to receive/send multiple messages at 
 
 ## Installation
 
-```pip install faster-fifo```
-
-(on a fresh Linux installation you might need some basic compiling tools `sudo apt install --reinstall build-essential gcc g++`)
+Linux CPython 3.13 wheels are attached to GitHub releases of this fork. It is not published to PyPI. A source install needs a C++ compiler.
 
 ## Manual build instructions
 
