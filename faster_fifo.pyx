@@ -4,6 +4,10 @@
 
 import ctypes
 import multiprocessing
+import sys
+
+from cpython.bytes cimport PyBytes_AsString, PyBytes_GET_SIZE
+from cpython.mem cimport PyMem_Malloc, PyMem_Free
 
 from ctypes import c_size_t
 from multiprocessing import context
@@ -55,12 +59,105 @@ cdef size_t msg_buf_addr(q):
     return caddr(q.message_buffer.val)
 
 cdef size_t bytes_to_ptr(b):
-    ptr = ctypes.cast(b, ctypes.POINTER(ctypes.c_byte))
-    return ctypes.addressof(ptr.contents)
+    return <size_t><void*>PyBytes_AsString(b)
+
+
+def _effective_start_method():
+    """Start method that will be used if a process is created from here.
+
+    Queue construction must not lock the start method, so an unset method
+    stays unset and the platform default is used only for this decision.
+    """
+    method = multiprocessing.get_start_method(allow_none=True)
+    if method is not None:
+        return method
+    if sys.platform == "darwin" or sys.platform == "win32":
+        return "spawn"
+    return "fork"
+
+
+def _is_raw_bytes_batch(xs):
+    for ele in xs:
+        if type(ele) is not bytes:
+            return False
+    return True
+
+
+cdef void* _cached_q(q):
+    return <void*><size_t>q._q_ptr
+
+
+cdef void* _cached_mem(q):
+    return <void*><size_t>q._mem_ptr
+
+
+cdef int _raise_put_status(int c_status) except -1:
+    if c_status == Q.Q_SUCCESS:
+        return 0
+    if c_status == Q.Q_FULL:
+        raise Full()
+    raise Exception("Unexpected queue error {}".format(c_status))
+
+
+cdef int _put_one_bytes(q, bytes payload, int block, float timeout) except -1:
+    """Copy one bytes object using the address cached at construction."""
+    cdef const void* msg_ptr = <const void*>PyBytes_AsString(payload)
+    cdef size_t msg_size = <size_t>PyBytes_GET_SIZE(payload)
+    cdef void* c_q_addr = _cached_q(q)
+    cdef void* c_buf_addr = _cached_mem(q)
+    cdef int c_status = 0
+    with nogil:
+        c_status = Q.queue_put(
+            c_q_addr, c_buf_addr, &msg_ptr, &msg_size, 1, block, timeout,
+        )
+    return _raise_put_status(c_status)
+
+
+cdef int _put_many_bytes(q, list xs, int block, float timeout) except -1:
+    """Copy a private list of bytes. The list keeps those objects alive across nogil."""
+    cdef size_t n = <size_t>len(xs)
+    cdef size_t i
+    cdef bytes item
+    cdef const void** ptrs
+    cdef size_t* sizes
+    cdef void* c_q_addr
+    cdef void* c_buf_addr
+    cdef int c_status = 0
+    if n == 0:
+        return 0
+    ptrs = <const void**>PyMem_Malloc(n * sizeof(void*))
+    sizes = <size_t*>PyMem_Malloc(n * sizeof(size_t))
+    if ptrs == NULL or sizes == NULL:
+        PyMem_Free(ptrs)
+        PyMem_Free(sizes)
+        raise MemoryError()
+    try:
+        for i in range(n):
+            item = <bytes>xs[i]
+            ptrs[i] = <const void*>PyBytes_AsString(item)
+            sizes[i] = <size_t>PyBytes_GET_SIZE(item)
+        c_q_addr = _cached_q(q)
+        c_buf_addr = _cached_mem(q)
+        with nogil:
+            c_status = Q.queue_put(
+                c_q_addr, c_buf_addr, ptrs, sizes, n, block, timeout,
+            )
+    finally:
+        PyMem_Free(ptrs)
+        PyMem_Free(sizes)
+    return _raise_put_status(c_status)
 
 
 class Queue:
     def __init__(self, max_size_bytes=DEFAULT_CIRCULAR_BUFFER_SIZE, maxsize=int(1e9), loads=None, dumps=None):
+        method = _effective_start_method()
+        if method != "fork":
+            raise QueueError(
+                "faster-fifo only supports the fork start method, got {}".format(
+                    method
+                )
+            )
+
         self.max_size_bytes = max_size_bytes
         self.maxsize = maxsize  # default maxsize
         self.max_bytes_to_read = self.max_size_bytes  # by default, read the whole queue if necessary
@@ -79,9 +176,17 @@ class Queue:
 
         Q.create_queue(<void *> q_addr(self), max_size_bytes, maxsize)
 
+        # Forked children inherit this mapping. Spawn unpickles the queue and
+        # is rejected in __setstate__.
+        self._q_ptr = q_addr(self)
+        self._mem_ptr = buf_addr(self)
+
         self.message_buffer: TLSBuffer = TLSBuffer(None)
 
         self.last_error: Optional[str] = None
+
+    def __setstate__(self, state):
+        raise QueueError("faster-fifo only supports the fork start method")
 
     def _error(self, message):
         self.last_error = message
@@ -111,6 +216,11 @@ class Queue:
     def put_many(self, xs, block=True, timeout=DEFAULT_TIMEOUT):
         if not isinstance(xs, (list, tuple)):
             self._error(f'put_many() expects a list or tuple, got {type(xs)}')
+
+        # bytes are copied as-is. Hecate's dumps already returns bytes unchanged.
+        if _is_raw_bytes_batch(xs):
+            _put_many_bytes(self, list(xs), block, timeout)
+            return
 
         xs = [self.dumps(ele) for ele in xs]
 
@@ -151,6 +261,9 @@ class Queue:
             raise Exception(f'Unexpected queue error {status}')
 
     def put(self, x, block=True, timeout=DEFAULT_TIMEOUT):
+        if type(x) is bytes:
+            _put_one_bytes(self, x, block, timeout)
+            return None
         status = self.put_many([x], block, timeout)
         if status == Q.Q_FULL:
             raise Full()

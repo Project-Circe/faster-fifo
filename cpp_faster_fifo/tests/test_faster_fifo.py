@@ -338,23 +338,13 @@ def spawn_consumer(data_q_):
 
 
 class TestSpawn(TestCase):
-    def test_spawn_ctx(self):
+    def test_spawn_ctx_is_rejected(self):
         ctx = multiprocessing.get_context("spawn")
         data_q = Queue(1000 * 1000)
-        procs = [ctx.Process(target=spawn_producer, args=(data_q,)) for _ in range(2)]
-        procs.append(ctx.Process(target=spawn_consumer, args=(data_q,)))
-
-        # add data to the queue and read some of it back to make sure all buffers are initialized before
-        # the new process is spawned (such that we need to pickle everything)
-        for i in range(10):
-            data_q.put(self.test_spawn_ctx.__name__)
-        msgs = data_q.get_many(max_messages_to_get=2)
-        print(msgs)
-
-        for p in procs:
-            p.start()
-        for p in procs:
-            p.join()
+        proc = ctx.Process(target=spawn_producer, args=(data_q,))
+        proc.start()
+        proc.join(10)
+        self.assertNotEqual(proc.exitcode, 0)
 
 
 # this can actually be used instead of Pickle if we know that we need to support only specific data types
@@ -390,7 +380,7 @@ def worker_test_subclass(_x: Queue, _y: Queue):
 
 class TestSubclass(TestCase):
     def test_subclass(self):
-        ctx = multiprocessing.get_context("spawn")
+        ctx = multiprocessing.get_context("fork")
 
         q = Queue()
         q.put(1)

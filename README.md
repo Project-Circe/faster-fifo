@@ -73,6 +73,12 @@ except Empty:
 
 ```
 
+## Fork only
+
+This build requires the `fork` start method. `Queue()` raises `QueueError` when the start method is `spawn` or `forkserver`, including the macOS default. Unpickling a queue also raises, which is how a `spawn` child is rejected.
+
+`put` and `put_many` of `bytes` copy the buffer directly and do not call `dumps`. The shared-memory address is cached at construction. Forked children inherit that mapping. Other objects still go through `dumps`. With the default pickler, `put(b"...")` writes the raw buffer and `get` will not turn it back into `bytes`. Pass `dumps`/`loads` where `dumps` returns `bytes` unchanged when that round trip matters.
+
 ## Performance comparison (faster-fifo vs multiprocessing.Queue)
 
 ##### System #1 (Intel(R) Core(TM) i9-7900X CPU @ 3.30GHz, 10 cores, Ubuntu 18.04)
@@ -112,6 +118,10 @@ python -m unittest
 (there are also C++ unit tests, should run them if C++ code was altered)
 
 ## Recent PyPI releases
+
+##### v1.6.0
+
+* Fork only. `put`/`put_many` of `bytes` copy the buffer directly. `spawn` and `forkserver` raise `QueueError`.
 
 ##### v1.5.2
 
