@@ -20,7 +20,7 @@ Adds `get_many()` and `put_many()` methods to receive/send multiple messages at 
 
 ## Installation
 
-Linux CPython 3.13 wheels are attached to GitHub releases of this fork. It is not published to PyPI. A source install needs a C++ compiler.
+The CPython 3.13 x86_64 wheel is `release/faster_fifo-1.6.1-cp313-cp313-manylinux_2_34_x86_64.whl`. It is not published to PyPI. A source install needs a C++ compiler.
 
 ## Manual build instructions
 
